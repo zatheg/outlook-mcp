@@ -59,7 +59,7 @@ function createAuthConfig(envPrefix = 'MS_') {
     clientId: process.env[`${envPrefix}CLIENT_ID`] || '',
     clientSecret: process.env[`${envPrefix}CLIENT_SECRET`] || '',
     redirectUri: process.env[`${envPrefix}REDIRECT_URI`] || 'http://localhost:3333/auth/callback',
-    scopes: (process.env[`${envPrefix}SCOPES`] || 'offline_access User.Read Mail.Read').split(' '),
+    scopes: (process.env[`${envPrefix}SCOPES`] || 'offline_access User.Read Mail.Read Mail.ReadWrite Mail.Send Calendars.Read Calendars.ReadWrite Files.Read Files.ReadWrite Sites.Read.All Sites.ReadWrite.All').split(' '),
     tenantId,
     tokenEndpoint: process.env[`${envPrefix}TOKEN_ENDPOINT`] || `${authorityHost}/${tenantId}/oauth2/v2.0/token`,
     authEndpoint: process.env[`${envPrefix}AUTH_ENDPOINT`] || `${authorityHost}/${tenantId}/oauth2/v2.0/authorize`
@@ -98,7 +98,8 @@ function setupOAuthRoutes(app, tokenStorage, authConfig, envPrefix = 'MS_') {
         redirect_uri: authConfig.redirectUri,
         scope: authConfig.scopes.join(' '),
         response_mode: 'query',
-        state: state
+        state: state,
+        prompt: 'consent'
       });
     res.redirect(authorizationUrl);
   });
