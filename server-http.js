@@ -106,12 +106,18 @@ async function loadOAuthTokens() {
   }
 }
 
-let _persistTimer = null;
-function scheduleOAuthPersist() {
-  // Debounce: persist at most once per second
-  if (_persistTimer) return;
-  _persistTimer = setTimeout(async () => {
-    _persistTimer = null;
+// Persist OAuth state to Secret Manager. Returns a promise that resolves once
+// THIS call's write reaches Secret Manager, so callers can `await` before
+// responding (critical: Cloud Run may SIGTERM the instance before any deferred
+// write fires, and clients holding a never-persisted refresh token would then
+// fail to refresh against the next instance, forcing full re-auth).
+//
+// Writes are serialised via a promise chain so concurrent callers don't race
+// to publish a stale snapshot. Each link captures `_serializeOAuthState()` at
+// the moment it runs, after the previous write completes.
+let _persistChain = Promise.resolve();
+function persistOAuthState() {
+  const next = _persistChain.then(async () => {
     const client = await _getSecretManagerClient();
     if (!client) return;
     try {
@@ -119,7 +125,6 @@ function scheduleOAuthPersist() {
         parent: _oauthSecretParent,
         payload: { data: Buffer.from(_serializeOAuthState()) },
       });
-      console.error('OAuth tokens persisted to Secret Manager');
     } catch (e) {
       // If secret doesn't exist yet, create it
       if (e.code === 5) {
@@ -141,7 +146,10 @@ function scheduleOAuthPersist() {
         console.error('Failed to persist OAuth tokens:', e.message);
       }
     }
-  }, 1000);
+  });
+  // Swallow errors on the chain itself so one failure doesn't poison later writes
+  _persistChain = next.catch(() => {});
+  return next;
 }
 
 // Allowed redirect URIs for Claude.ai and Claude Code
@@ -260,17 +268,21 @@ async function initGcpTokens() {
 }
 
 // ── Bearer token middleware ──────────────────────────────────────────────────
+// resource_metadata in WWW-Authenticate points MCP clients (Claude Code, Claude.ai)
+// at our PRM so they can discover scopes_supported (notably offline_access) and
+// silently refresh access tokens instead of forcing a fresh browser flow.
+const PRM_URL = `${CLOUD_RUN_URL}/.well-known/oauth-protected-resource`;
 function requireBearerToken(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.set('WWW-Authenticate', 'Bearer');
+    res.set('WWW-Authenticate', `Bearer resource_metadata="${PRM_URL}"`);
     return res.status(401).json({ error: 'unauthorized', error_description: 'Bearer token required' });
   }
   const token = authHeader.slice(7);
   const tokenData = activeTokens.get(token);
   if (!tokenData || Date.now() > tokenData.expires_at) {
     activeTokens.delete(token);
-    res.set('WWW-Authenticate', 'Bearer error="invalid_token"');
+    res.set('WWW-Authenticate', `Bearer error="invalid_token", resource_metadata="${PRM_URL}"`);
     return res.status(401).json({ error: 'invalid_token', error_description: 'Token expired or invalid' });
   }
   next();
@@ -295,12 +307,16 @@ async function main() {
   app.get('/health', (req, res) => res.send('OK'));
 
   // ── OAuth 2.1 Authorization Server Metadata (RFC 8414) ──
+  // scopes_supported MUST include offline_access — Claude Code only appends
+  // it to the authorization request when it sees it advertised here, which is
+  // what unlocks silent refresh.
   app.get('/.well-known/oauth-authorization-server', (req, res) => {
     res.json({
       issuer: CLOUD_RUN_URL,
       authorization_endpoint: `${CLOUD_RUN_URL}/authorize`,
       token_endpoint: `${CLOUD_RUN_URL}/token`,
       registration_endpoint: `${CLOUD_RUN_URL}/register`,
+      scopes_supported: ['openid', 'offline_access'],
       response_types_supported: ['code'],
       grant_types_supported: ['authorization_code', 'refresh_token'],
       token_endpoint_auth_methods_supported: ['none'],
@@ -308,8 +324,21 @@ async function main() {
     });
   });
 
+  // ── OAuth 2.0 Protected Resource Metadata (RFC 9728) ──
+  // Claude Code prefers PRM over OASM for scope discovery. Serve at both the
+  // bare path and the /mcp-suffixed path so strict and lenient clients both
+  // resolve to the same metadata.
+  const prmPayload = {
+    resource: `${CLOUD_RUN_URL}/mcp`,
+    authorization_servers: [CLOUD_RUN_URL],
+    scopes_supported: ['openid', 'offline_access'],
+    bearer_methods_supported: ['header'],
+  };
+  app.get('/.well-known/oauth-protected-resource', (req, res) => res.json(prmPayload));
+  app.get('/.well-known/oauth-protected-resource/mcp', (req, res) => res.json(prmPayload));
+
   // ── Dynamic Client Registration (RFC 7591) ──
-  app.post('/register', (req, res) => {
+  app.post('/register', async (req, res) => {
     const { client_name, redirect_uris } = req.body;
 
     // Validate redirect URIs
@@ -329,7 +358,7 @@ async function main() {
       client_id_issued_at: Math.floor(Date.now() / 1000),
     };
     registeredClients.set(clientId, clientData);
-    scheduleOAuthPersist();
+    await persistOAuthState();
     console.error(`Registered OAuth client: ${client_name} (${clientId})`);
 
     res.status(201).json(clientData);
@@ -407,7 +436,9 @@ async function main() {
   });
 
   // ── Token Endpoint ──
-  app.post('/token', (req, res) => {
+  // Persist BEFORE responding so the new (rotated) refresh token reaches Secret
+  // Manager before the client could use it against a different Cloud Run instance.
+  app.post('/token', async (req, res) => {
     const { grant_type, code, redirect_uri, code_verifier, client_id, refresh_token } = req.body;
 
     // ── Refresh token grant ──
@@ -423,7 +454,7 @@ async function main() {
       const expiresIn = OAUTH_TOKEN_EXPIRES_IN;
       activeTokens.set(accessToken, { client_id: rtData.client_id, expires_at: Date.now() + expiresIn * 1000 });
       refreshTokens.set(newRefreshToken, { client_id: rtData.client_id });
-      scheduleOAuthPersist();
+      await persistOAuthState();
 
       return res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: expiresIn, refresh_token: newRefreshToken });
     }
@@ -464,7 +495,7 @@ async function main() {
 
     activeTokens.set(accessToken, { client_id: codeData.client_id, expires_at: Date.now() + expiresIn * 1000 });
     refreshTokens.set(newRefreshToken, { client_id: codeData.client_id });
-    scheduleOAuthPersist();
+    await persistOAuthState();
 
     console.error(`Access token issued for client ${codeData.client_id}`);
     res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: expiresIn, refresh_token: newRefreshToken });
@@ -489,11 +520,28 @@ async function main() {
   });
 
   const PORT = parseInt(process.env.PORT || '8080', 10);
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.error(`${config.SERVER_NAME} HTTP server listening on port ${PORT}`);
     console.error(`MS OAuth login: ${CLOUD_RUN_URL}/auth`);
     console.error(`MCP OAuth metadata: ${CLOUD_RUN_URL}/.well-known/oauth-authorization-server`);
   });
+
+  // Drain in-flight persists on SIGTERM (Cloud Run gives ~10s grace before SIGKILL).
+  // Without this, a refresh token that just rotated could be lost if the instance
+  // shuts down mid-write, and the client's next refresh would fail.
+  const shutdown = async (signal) => {
+    console.error(`${signal} received — flushing OAuth state and closing server`);
+    try {
+      await _persistChain;
+    } catch (e) {
+      console.error('Error draining persist chain:', e.message);
+    }
+    server.close(() => process.exit(0));
+    // Hard timeout as a safety net
+    setTimeout(() => process.exit(0), 8000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 main().catch((e) => {
